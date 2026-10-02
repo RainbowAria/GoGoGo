@@ -62,6 +62,8 @@ class NetworkTrainingConfig:
     policy_channels: int
     value_channels: int
     value_hidden_size: int
+    # Ownership and final-score heads trained as auxiliary targets (KataGo).
+    auxiliary_heads: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,12 @@ class SearchTrainingConfig:
     dirichlet_epsilon: float
     root_temperature: float
     temperature_moves: int
+    # Leaves evaluated per network call; 1 reproduces the sequential search.
+    leaf_batch_size: int = 1
+    # Playout cap randomization: only this share of self-play moves uses the
+    # full search and becomes a policy target; the rest use a cheap search.
+    full_search_probability: float = 1.0
+    fast_simulations_per_move: int = 16
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,11 @@ class OptimizerTrainingConfig:
     weight_decay: float
     gradient_clip_norm: float
     use_board_symmetry_augmentation: bool
+    # Average gradient-sample draws per new self-play sample; None keeps the
+    # fixed training_steps_per_iteration, otherwise that value is the cap.
+    target_sample_reuse: Optional[float] = None
+    ownership_loss_weight: float = 1.5
+    score_loss_weight: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -125,6 +138,11 @@ class EvaluationTrainingConfig:
     teacher_labels_path: str
     position_simulations_per_move: int
     confidence_level: float
+    # Sequential sign test on decisive opening pairs (promotion_test "paired_sprt").
+    sprt_alpha: float = 0.05
+    sprt_beta: float = 0.10
+    sprt_pair_win_rate: float = 0.65
+    sprt_batch_pairs: int = 4
 
 
 @dataclass(frozen=True)
@@ -189,6 +207,7 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "policy_channels": 2,
         "value_channels": 1,
         "value_hidden_size": 64,
+        "auxiliary_heads": True,
     },
     "search": {
         "simulations_per_move": 64,
@@ -197,10 +216,14 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "dirichlet_epsilon": 0.25,
         "root_temperature": 1.0,
         "temperature_moves": 20,
+        # Batched leaves let even two self-play workers fill GPU batches.
+        "leaf_batch_size": 4,
+        "full_search_probability": 0.25,
+        "fast_simulations_per_move": 16,
     },
     "self_play": {
         "workers": 2,
-        "games_per_iteration": 16,
+        "games_per_iteration": 32,
         "inference_batch_size": 8,
         "champion_fraction": 0.25,
         "milestone_fraction": 0.25,
@@ -218,12 +241,15 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "weight_decay": 0.0001,
         "gradient_clip_norm": 5.0,
         "use_board_symmetry_augmentation": True,
+        "target_sample_reuse": 8.0,
+        "ownership_loss_weight": 1.5,
+        "score_loss_weight": 0.5,
     },
     "evaluation": {
-        "games": 40,
+        "games": 80,
         "simulations_per_move": 96,
         "promotion_win_rate": 0.55,
-        "promotion_test": "paired_sign",
+        "promotion_test": "paired_sprt",
         "confirmation_max_game_length_factor": 4.0,
         "screen_games": 4,
         "screen_simulations_per_move": 8,
@@ -237,6 +263,10 @@ _BALANCED_PRESET: Dict[str, Any] = {
         "teacher_labels_path": "config/rl_eval_teacher_9x9.json",
         "position_simulations_per_move": 8,
         "confidence_level": 0.95,
+        "sprt_alpha": 0.05,
+        "sprt_beta": 0.10,
+        "sprt_pair_win_rate": 0.65,
+        "sprt_batch_pairs": 4,
     },
     "runtime": {
         "pause_while_game_is_active": True,
@@ -274,6 +304,7 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "policy_channels": 4,
         "value_channels": 2,
         "value_hidden_size": 256,
+        "auxiliary_heads": False,
     },
     "search": {
         "simulations_per_move": 400,
@@ -282,6 +313,9 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "dirichlet_epsilon": 0.25,
         "root_temperature": 1.0,
         "temperature_moves": 30,
+        "leaf_batch_size": 1,
+        "full_search_probability": 1.0,
+        "fast_simulations_per_move": 100,
     },
     "self_play": {
         "workers": 8,
@@ -302,6 +336,9 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "weight_decay": 0.0001,
         "gradient_clip_norm": 5.0,
         "use_board_symmetry_augmentation": True,
+        "target_sample_reuse": None,
+        "ownership_loss_weight": 1.5,
+        "score_loss_weight": 0.5,
     },
     "evaluation": {
         "games": 40,
@@ -321,6 +358,10 @@ _HIGH_PERFORMANCE_PRESET: Dict[str, Any] = {
         "teacher_labels_path": "",
         "position_simulations_per_move": 16,
         "confidence_level": 0.95,
+        "sprt_alpha": 0.05,
+        "sprt_beta": 0.10,
+        "sprt_pair_win_rate": 0.65,
+        "sprt_batch_pairs": 4,
     },
     "runtime": {
         "pause_while_game_is_active": True,
@@ -422,7 +463,18 @@ def _build_config(preset: str, data: Mapping[str, Any]) -> RLTrainingConfig:
 
 
 def _validate_config(config: RLTrainingConfig) -> None:
-    game = config.game
+    # Sections are checked in this order, so the first reported error is stable.
+    _validate_game(config.game)
+    _validate_hardware(config.hardware)
+    _validate_network(config.network)
+    _validate_search(config.search)
+    _validate_self_play(config.self_play)
+    _validate_optimizer(config.optimizer)
+    _validate_evaluation(config.evaluation, config.game.board_size)
+    _validate_runtime(config.runtime)
+
+
+def _validate_game(game: GameTrainingConfig) -> None:
     _require_int("game.board_size", game.board_size, 1)
     if game.board_size not in (9, 13, 19):
         raise _config_error("game.board_size", "目前只支持 9、13 或 19")
@@ -440,7 +492,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     if game.allow_suicide:
         raise _config_error("game.allow_suicide", "当前规则引擎禁止自杀")
 
-    hardware = config.hardware
+
+def _validate_hardware(hardware: HardwareTrainingConfig) -> None:
     if not isinstance(hardware.device, str) or not re.fullmatch(
         r"(?:auto|cpu|mps|cuda(?::\d+)?)",
         hardware.device,
@@ -469,7 +522,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_int("hardware.data_loader_workers", hardware.data_loader_workers)
     _require_bool("hardware.pin_memory", hardware.pin_memory)
 
-    network = config.network
+
+def _validate_network(network: NetworkTrainingConfig) -> None:
     for name, value in (
         ("channels", network.channels),
         ("policy_channels", network.policy_channels),
@@ -480,17 +534,29 @@ def _validate_config(config: RLTrainingConfig) -> None:
     if network.channels % 8:
         raise _config_error("network.channels", "必须是 8 的倍数，以便高效使用 GPU")
     _require_int("network.residual_blocks", network.residual_blocks, 1)
+    _require_bool("network.auxiliary_heads", network.auxiliary_heads)
 
-    search = config.search
+
+def _validate_search(search: SearchTrainingConfig) -> None:
     _require_int("search.simulations_per_move", search.simulations_per_move, 1)
+    _require_int("search.leaf_batch_size", search.leaf_batch_size, 1)
     _require_positive_number("search.c_puct", search.c_puct)
     _require_positive_number("search.dirichlet_alpha", search.dirichlet_alpha)
     _require_probability("search.dirichlet_epsilon", search.dirichlet_epsilon)
     if _require_number("search.root_temperature", search.root_temperature) < 0:
         raise _config_error("search.root_temperature", "不能小于 0")
     _require_int("search.temperature_moves", search.temperature_moves)
+    _require_probability(
+        "search.full_search_probability",
+        search.full_search_probability,
+        include_zero=False,
+    )
+    # Values above simulations_per_move are capped at run time, so small test
+    # and smoke budgets need not restate the fast budget.
+    _require_int("search.fast_simulations_per_move", search.fast_simulations_per_move, 1)
 
-    self_play = config.self_play
+
+def _validate_self_play(self_play: SelfPlayTrainingConfig) -> None:
     _require_int("self_play.workers", self_play.workers, 1)
     _require_int("self_play.games_per_iteration", self_play.games_per_iteration, 1)
     _require_int("self_play.inference_batch_size", self_play.inference_batch_size, 1)
@@ -515,7 +581,8 @@ def _validate_config(config: RLTrainingConfig) -> None:
             )
     _require_int("self_play.resign_min_move", self_play.resign_min_move)
 
-    optimizer = config.optimizer
+
+def _validate_optimizer(optimizer: OptimizerTrainingConfig) -> None:
     _require_int("optimizer.batch_size", optimizer.batch_size, 1)
     _require_int(
         "optimizer.replay_buffer_capacity",
@@ -553,8 +620,14 @@ def _validate_config(config: RLTrainingConfig) -> None:
         "optimizer.use_board_symmetry_augmentation",
         optimizer.use_board_symmetry_augmentation,
     )
+    if optimizer.target_sample_reuse is not None:
+        _require_positive_number("optimizer.target_sample_reuse", optimizer.target_sample_reuse)
+    for name in ("ownership_loss_weight", "score_loss_weight"):
+        if _require_number(f"optimizer.{name}", getattr(optimizer, name)) < 0:
+            raise _config_error(f"optimizer.{name}", "不能小于 0")
 
-    evaluation = config.evaluation
+
+def _validate_evaluation(evaluation: EvaluationTrainingConfig, board_size: int) -> None:
     _require_int("evaluation.games", evaluation.games, 2)
     if evaluation.games % 2:
         raise _config_error("evaluation.games", "必须是偶数，便于双方交换黑白")
@@ -566,8 +639,17 @@ def _validate_config(config: RLTrainingConfig) -> None:
     _require_probability("evaluation.promotion_win_rate", evaluation.promotion_win_rate)
     if evaluation.promotion_win_rate <= 0.5:
         raise _config_error("evaluation.promotion_win_rate", "必须大于 0.5")
-    if evaluation.promotion_test not in ("paired_hoeffding", "paired_sign"):
-        raise _config_error("evaluation.promotion_test", "必须是 paired_hoeffding 或 paired_sign")
+    if evaluation.promotion_test not in ("paired_hoeffding", "paired_sign", "paired_sprt"):
+        raise _config_error("evaluation.promotion_test",
+                            "必须是 paired_hoeffding、paired_sign 或 paired_sprt")
+    for name in ("sprt_alpha", "sprt_beta"):
+        value = _require_number(f"evaluation.{name}", getattr(evaluation, name))
+        if not 0 < value < 0.5:
+            raise _config_error(f"evaluation.{name}", "必须大于 0 且小于 0.5")
+    pair_rate = _require_number("evaluation.sprt_pair_win_rate", evaluation.sprt_pair_win_rate)
+    if not 0.5 < pair_rate < 1:
+        raise _config_error("evaluation.sprt_pair_win_rate", "必须大于 0.5 且小于 1")
+    _require_int("evaluation.sprt_batch_pairs", evaluation.sprt_batch_pairs, 1)
     if _require_number("evaluation.confirmation_max_game_length_factor",
                        evaluation.confirmation_max_game_length_factor) < 1:
         raise _config_error("evaluation.confirmation_max_game_length_factor", "不能小于 1")
@@ -590,10 +672,11 @@ def _validate_config(config: RLTrainingConfig) -> None:
             raise _config_error(f"evaluation.{name}", "必须是有效路径字符串")
     if bool(evaluation.position_suite_path) != bool(evaluation.teacher_labels_path):
         raise _config_error("evaluation", "固定局面与 KataGo 标注必须同时设置或同时留空")
-    if game.board_size != 9 and evaluation.position_suite_path:
+    if board_size != 9 and evaluation.position_suite_path:
         raise _config_error("evaluation.position_suite_path", "当前固定局面评测只支持 9×9")
 
-    runtime = config.runtime
+
+def _validate_runtime(runtime: RuntimeTrainingConfig) -> None:
     _require_bool(
         "runtime.pause_while_game_is_active",
         runtime.pause_while_game_is_active,
@@ -617,7 +700,6 @@ def _validate_config(config: RLTrainingConfig) -> None:
     if "\x00" in runtime.output_directory:
         raise _config_error("runtime.output_directory", "不能包含空字符")
     _require_int("runtime.random_seed", runtime.random_seed)
-
 
 def resolve_rl_training_config(
     preset: str = DEFAULT_RL_PRESET,

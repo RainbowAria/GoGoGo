@@ -7,6 +7,8 @@ and reused independently.  Coordinates are zero based: ``(row, column)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import random
 from typing import Iterable, Iterator, Literal, Optional
 
 
@@ -17,6 +19,39 @@ WHITE = 2
 Point = tuple[int, int]
 BoardHash = tuple[tuple[int, ...], ...]
 MoveKind = Literal["play", "pass", "resign"]
+
+
+@lru_cache(maxsize=None)
+def _zobrist_keys(size: int) -> tuple[tuple[int, int, int], ...]:
+    """Per-point random keys indexed by flat point, then color (EMPTY unused)."""
+
+    rng = random.Random(0x60601 + size)
+    return tuple(
+        (0, rng.getrandbits(64), rng.getrandbits(64)) for _ in range(size * size)
+    )
+
+
+@lru_cache(maxsize=None)
+def _flat_neighbor_table(size: int) -> tuple[tuple[int, ...], ...]:
+    """Neighbors of each flat point ``row * size + col``, as flat points."""
+
+    return tuple(
+        tuple(r * size + c for r, c in neighbors)
+        for neighbors in _neighbor_table(size)
+    )
+
+
+@lru_cache(maxsize=None)
+def _neighbor_table(size: int) -> tuple[tuple[Point, ...], ...]:
+    table = []
+    for row in range(size):
+        for col in range(size):
+            table.append(tuple(
+                (r, c)
+                for r, c in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1))
+                if 0 <= r < size and 0 <= c < size
+            ))
+    return tuple(table)
 
 
 def opponent(color: int) -> int:
@@ -137,8 +172,29 @@ class GoGame:
         self.last_move: Optional[Point] = None
         self.score_result: Optional[ScoreResult] = None
         self.moves: list[MoveRecord] = []
-        self._position_history: set[BoardHash] = {self.board_hash()}
+        self._position_history = {self.board_hash()}
         self._undo_stack: list[_Snapshot] = []
+
+    @property
+    def _position_history(self) -> set[BoardHash]:
+        return self._history
+
+    @_position_history.setter
+    def _position_history(self, history: set[BoardHash]) -> None:
+        # The Zobrist set is a no-false-negative filter for the exact set above.
+        self._history = history
+        self._zobrist_history = {self._zobrist(board) for board in history}
+
+    def _zobrist(self, board: Iterable[Iterable[int]]) -> int:
+        keys = _zobrist_keys(self.size)
+        value = 0
+        index = 0
+        for board_row in board:
+            for stone in board_row:
+                if stone:
+                    value ^= keys[index][stone]
+                index += 1
+        return value
 
     @property
     def move_number(self) -> int:
@@ -155,7 +211,10 @@ class GoGame:
     def clone(self) -> "GoGame":
         """Return an independent copy suitable for AI analysis."""
 
-        clone = GoGame(self.size, self.komi, record_undo=self._record_undo)
+        clone = GoGame.__new__(GoGame)
+        clone.size = self.size
+        clone._record_undo = self._record_undo
+        clone.komi = self.komi
         clone.board = [row[:] for row in self.board]
         clone.current_player = self.current_player
         clone.captures = dict(self.captures)
@@ -167,20 +226,14 @@ class GoGame:
         clone.last_move = self.last_move
         clone.score_result = self.score_result
         clone.moves = list(self.moves)
-        clone._position_history = set(self._position_history)
+        clone._history = set(self._history)
+        clone._zobrist_history = set(self._zobrist_history)
         # Analysis copies do not need to inherit the user's undo stack.
         clone._undo_stack = []
         return clone
 
-    def neighbors(self, row: int, col: int) -> Iterator[Point]:
-        if row > 0:
-            yield row - 1, col
-        if row + 1 < self.size:
-            yield row + 1, col
-        if col > 0:
-            yield row, col - 1
-        if col + 1 < self.size:
-            yield row, col + 1
+    def neighbors(self, row: int, col: int) -> tuple[Point, ...]:
+        return _neighbor_table(self.size)[row * self.size + col]
 
     def group_and_liberties(
         self,
@@ -285,7 +338,8 @@ class GoGame:
         self.moves.append(
             MoveRecord("play", color, row=row, col=col, captured=analysis.captured)
         )
-        self._position_history.add(analysis.board)
+        self._history.add(analysis.board)
+        self._zobrist_history.add(self._zobrist(analysis.board))
         self.current_player = opponent(color)
         return analysis
 
@@ -355,29 +409,96 @@ class GoGame:
     def legal_moves(self, color: Optional[int] = None) -> Iterator[Point]:
         """Yield every legal board move for ``color`` (passes are not included)."""
 
-        move_color = self.current_player if color is None else color
-        for row in range(self.size):
-            for col in range(self.size):
-                if self.board[row][col] == EMPTY:
-                    if self.analyze_move(row, col, move_color).legal:
-                        yield row, col
+        size = self.size
+        for point in self.legal_points(color):
+            yield divmod(point, size)
 
-    def calculate_score(self) -> ScoreResult:
-        """Score the current position with Chinese area scoring.
+    def legal_points(self, color: Optional[int] = None) -> list[int]:
+        """Flat indices ``row * size + col`` of every legal board move, row-major.
 
-        Empty regions bordered by only one color count as that color's territory.
-        Empty regions touching both colors are neutral.  Players should capture
-        dead stones before passing because automatic life-and-death adjudication
-        is intentionally outside the scope of this local game.
+        Every group is labelled once; a candidate is then legal if it touches
+        an empty point, a friendly group with another liberty, or an enemy group
+        in atari, and its resulting position passes the superko check.
         """
 
-        black_stones = sum(row.count(BLACK) for row in self.board)
-        white_stones = sum(row.count(WHITE) for row in self.board)
-        black_territory = 0
-        white_territory = 0
-        neutral_points = 0
-        visited: set[Point] = set()
+        move_color = self.current_player if color is None else color
+        if move_color not in (BLACK, WHITE) or self.game_over:
+            return []
+        size = self.size
+        area = size * size
+        enemy = WHITE if move_color == BLACK else BLACK
+        keys = _zobrist_keys(size)
+        neighbors = _flat_neighbor_table(size)
+        stones_at = [stone for board_row in self.board for stone in board_row]
 
+        group_of = [-1] * area
+        group_stones: list[list[int]] = []
+        liberty_counts: list[int] = []
+        current_hash = 0
+        for point in range(area):
+            color_here = stones_at[point]
+            if color_here == EMPTY:
+                continue
+            current_hash ^= keys[point][color_here]
+            if group_of[point] >= 0:
+                continue
+            index = len(group_stones)
+            stones: list[int] = []
+            liberties: set[int] = set()
+            group_of[point] = index
+            pending = [point]
+            while pending:
+                stone = pending.pop()
+                stones.append(stone)
+                for neighbor in neighbors[stone]:
+                    value = stones_at[neighbor]
+                    if value == EMPTY:
+                        liberties.add(neighbor)
+                    elif value == color_here and group_of[neighbor] < 0:
+                        group_of[neighbor] = index
+                        pending.append(neighbor)
+            group_stones.append(stones)
+            liberty_counts.append(len(liberties))
+
+        zobrist_history = self._zobrist_history
+        legal: list[int] = []
+        for point in range(area):
+            if stones_at[point] != EMPTY:
+                continue
+            has_liberty = False
+            captured: set[int] = set()
+            for neighbor in neighbors[point]:
+                value = stones_at[neighbor]
+                if value == EMPTY:
+                    has_liberty = True
+                elif value == move_color:
+                    if liberty_counts[group_of[neighbor]] > 1:
+                        has_liberty = True
+                elif liberty_counts[group_of[neighbor]] == 1:
+                    captured.add(group_of[neighbor])
+            if not (has_liberty or captured):
+                continue  # suicide
+            next_hash = current_hash ^ keys[point][move_color]
+            for index in captured:
+                for stone in group_stones[index]:
+                    next_hash ^= keys[stone][enemy]
+            # A miss proves the position is new; a hit is confirmed exactly.
+            if next_hash in zobrist_history and not self.analyze_move(
+                point // size, point % size, move_color
+            ).legal:
+                continue
+            legal.append(point)
+        return legal
+
+    def area_ownership(self) -> list[list[int]]:
+        """Owner of every point under area scoring: BLACK, WHITE, or EMPTY (neutral).
+
+        Stones belong to their color; an empty region belongs to a color only
+        when every stone bordering it has that color.
+        """
+
+        owners = [row[:] for row in self.board]
+        visited: set[Point] = set()
         for start_row in range(self.size):
             for start_col in range(self.size):
                 if self.board[start_row][start_col] != EMPTY:
@@ -401,12 +522,26 @@ class GoGame:
                         elif value in (BLACK, WHITE):
                             borders.add(value)
 
-                if borders == {BLACK}:
-                    black_territory += len(region)
-                elif borders == {WHITE}:
-                    white_territory += len(region)
-                else:
-                    neutral_points += len(region)
+                owner = borders.pop() if len(borders) == 1 else EMPTY
+                for row, col in region:
+                    owners[row][col] = owner
+        return owners
+
+    def calculate_score(self) -> ScoreResult:
+        """Score the current position with Chinese area scoring.
+
+        Empty regions bordered by only one color count as that color's territory.
+        Empty regions touching both colors are neutral.  Players should capture
+        dead stones before passing because automatic life-and-death adjudication
+        is intentionally outside the scope of this local game.
+        """
+
+        black_stones = sum(row.count(BLACK) for row in self.board)
+        white_stones = sum(row.count(WHITE) for row in self.board)
+        owners = self.area_ownership()
+        black_territory = sum(row.count(BLACK) for row in owners) - black_stones
+        white_territory = sum(row.count(WHITE) for row in owners) - white_stones
+        neutral_points = sum(row.count(EMPTY) for row in owners)
 
         black_total = float(black_stones + black_territory)
         white_total = float(white_stones + white_territory) + self.komi

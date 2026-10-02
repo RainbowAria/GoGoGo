@@ -27,8 +27,12 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertEqual(config.self_play.workers, 2)
         self.assertEqual(config.self_play.champion_fraction, 0.25)
         self.assertEqual(config.self_play.milestone_fraction, 0.25)
-        self.assertEqual(config.evaluation.games, 40)
-        self.assertEqual(config.evaluation.promotion_test, "paired_sign")
+        self.assertEqual(config.evaluation.games, 80)
+        self.assertEqual(config.evaluation.promotion_test, "paired_sprt")
+        self.assertTrue(config.network.auxiliary_heads)
+        self.assertEqual(config.search.full_search_probability, 0.25)
+        self.assertEqual(config.optimizer.target_sample_reuse, 8.0)
+        self.assertEqual(config.search.leaf_batch_size, 4)
         self.assertEqual(config.evaluation.confirmation_max_game_length_factor, 4.0)
         self.assertEqual(config.network.channels, 64)
         self.assertLessEqual(config.hardware.gpu_memory_fraction, 0.60)
@@ -53,6 +57,10 @@ class RLTrainingConfigTests(unittest.TestCase):
         self.assertGreater(high.optimizer.batch_size, balanced.optimizer.batch_size)
         self.assertEqual(high.self_play.milestone_fraction, 0.0)
         self.assertEqual(high.evaluation.promotion_test, "paired_hoeffding")
+        # The KataGo line already has its own playout cap and auxiliary heads.
+        self.assertFalse(high.network.auxiliary_heads)
+        self.assertEqual(high.search.full_search_probability, 1.0)
+        self.assertIsNone(high.optimizer.target_sample_reuse)
         self.assertGreater(
             high.hardware.gpu_memory_fraction,
             balanced.hardware.gpu_memory_fraction,
@@ -65,6 +73,19 @@ class RLTrainingConfigTests(unittest.TestCase):
         example = load_rl_training_config(example_path)
         self.assertEqual(example.preset, "high_performance")
         self.assertEqual(example.hardware.device, "cuda:0")
+
+    def test_parallel_config_only_tunes_self_play_throughput(self) -> None:
+        parallel = load_rl_training_config(
+            DEFAULT_RL_CONFIG_PATH.parent / "rl_training.balanced.parallel.json"
+        )
+        balanced = resolve_rl_training_config("balanced")
+        self.assertEqual(parallel.preset, "balanced")
+        self.assertEqual(parallel.self_play.workers, 12)
+        self.assertEqual(parallel.search.leaf_batch_size, 4)
+        self.assertEqual(parallel.game, balanced.game)
+        self.assertEqual(parallel.network, balanced.network)
+        self.assertEqual(parallel.search.simulations_per_move,
+                         balanced.search.simulations_per_move)
 
     def test_nested_overrides_do_not_mutate_the_builtin_preset(self) -> None:
         custom = resolve_rl_training_config(

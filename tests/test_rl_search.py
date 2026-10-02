@@ -8,7 +8,7 @@ if AVAILABLE:
     import numpy as np
     from weiqi.rl.search import search
     from weiqi.rl.selfplay import GameJob, evaluation_summary, play_game
-    from weiqi.rl.state import Position, augment
+    from weiqi.rl.state import Position, augment, augment_batch
 
 from weiqi.engine import BLACK, WHITE, GoGame
 from weiqi.rl_config import resolve_rl_training_config
@@ -24,6 +24,62 @@ class SearchTests(unittest.TestCase):
         logits = np.full(features.shape[-1] ** 2 + 1, -100.0)
         logits[-1] = 100.0
         return logits, 0.0
+
+    @staticmethod
+    def seeded_evaluator(features):
+        generator = np.random.default_rng(int(abs(features.sum() * 1000)) % 9973)
+        return generator.normal(size=features.shape[-1] ** 2 + 1), float(generator.uniform(-0.9, 0.9))
+
+    def batch_evaluator(self, batch):
+        rows = [self.seeded_evaluator(features) for features in batch]
+        return np.array([row[0] for row in rows]), np.array([row[1] for row in rows])
+
+    def test_single_leaf_batches_match_the_sequential_search(self):
+        position = Position.new(9, 6.5)
+        expected = search(position, self.seeded_evaluator, self.config.search,
+                          np.random.default_rng(4), simulations=32, add_noise=True)
+        actual = search(position, self.seeded_evaluator, self.config.search,
+                        np.random.default_rng(4), simulations=32, add_noise=True,
+                        evaluate_batch=self.batch_evaluator)
+        np.testing.assert_array_equal(actual[0], expected[0])
+        self.assertEqual(actual[1], expected[1])
+
+    def test_batched_leaves_use_every_simulation_and_leave_no_virtual_loss(self):
+        from dataclasses import replace
+        config = replace(self.config.search, leaf_batch_size=8)
+        for simulations in (1, 7, 33):
+            policy, value = search(Position.new(9, 6.5), self.seeded_evaluator, config,
+                                   np.random.default_rng(1), simulations=simulations,
+                                   evaluate_batch=self.batch_evaluator)
+            self.assertAlmostEqual(float(policy.sum()), 1.0, places=5)
+            self.assertLessEqual(abs(value), 1.0)
+            self.assertAlmostEqual(float((policy * simulations).sum()), simulations, places=3)
+
+    def test_batch_augmentation_matches_row_wise_augmentation(self):
+        generator = np.random.default_rng(0)
+        features = generator.random((32, 20, 9, 9)).astype(np.float32)
+        policies = generator.random((32, 82)).astype(np.float32)
+        symmetries = np.arange(32) % 8
+        batch_features, batch_policies = augment_batch(features, policies, symmetries)
+        for row, symmetry in enumerate(symmetries):
+            expected = augment(features[row], policies[row], int(symmetry))
+            np.testing.assert_array_equal(batch_features[row], expected[0])
+            np.testing.assert_array_equal(batch_policies[row], expected[1])
+
+    def test_replay_sampling_returns_float32_batches_without_a_dataloader(self):
+        from weiqi.rl.storage import ReplayBuffer
+        generator = np.random.default_rng(1)
+        replay = ReplayBuffer(100, 9, True)
+        policy = np.full(82, 1 / 82, dtype=np.float32)
+        replay.extend([(generator.random((20, 9, 9)).astype(np.float32), policy, 1.0)
+                       for _ in range(10)])
+        features, policies, values, ownership, scores, weights = replay.sample(16)
+        self.assertEqual(tuple(ownership.shape), (16, 81))
+        self.assertEqual(float(weights.sum()), 0.0)  # legacy 3-tuples carry no aux targets
+        self.assertEqual(tuple(features.shape), (16, 20, 9, 9))
+        self.assertEqual(tuple(policies.shape), (16, 82))
+        self.assertEqual(tuple(values.shape), (16,))
+        self.assertAlmostEqual(float(policies.sum(dim=1).min()), 1.0, places=5)
 
     def test_terminal_win_and_loss_are_backed_up_in_root_perspective(self):
         # White can end an empty board and win on komi.
@@ -82,7 +138,7 @@ class SearchTests(unittest.TestCase):
 
     def test_real_two_pass_episode_labels_both_players_correctly(self):
         config = resolve_rl_training_config(overrides={
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
         })
         game = play_game(config, GameJob(0, 3), lambda _, x: self.pass_evaluator(x), training=True)
         self.assertEqual(game.reason, "two_passes")
@@ -97,7 +153,7 @@ class SearchTests(unittest.TestCase):
 
     def test_move_limit_does_not_create_fake_winner_or_replay_targets(self):
         config = resolve_rl_training_config(overrides={
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
             "self_play": {"max_game_length_factor": 1.0},
         })
         def no_pass(_, features):

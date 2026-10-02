@@ -18,7 +18,7 @@ if AVAILABLE:
     from weiqi.rl.selfplay import GameJob, run_games
     from weiqi.rl.state import Position
     from weiqi.rl.storage import ReplayBuffer, checkpoint_config, cpu_state, fingerprint, load_checkpoint
-    from weiqi.rl.eval_positions import file_hash
+    from weiqi.fileio import sha256_file
 
 from weiqi.rl_config import resolve_rl_training_config
 
@@ -29,10 +29,11 @@ class RuntimeTests(unittest.TestCase):
         return resolve_rl_training_config(overrides={
             "hardware": {"device": "cpu", "precision": "float32", "data_loader_workers": 0},
             "network": {"channels": 8, "residual_blocks": 1},
-            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0},
+            "search": {"simulations_per_move": 1, "dirichlet_epsilon": 0.0, "full_search_probability": 1.0},
             "self_play": {"games_per_iteration": 2},
             "optimizer": {"batch_size": 4, "minimum_replay_size": 1,
-                          "training_steps_per_iteration": 2, "use_board_symmetry_augmentation": False},
+                          "training_steps_per_iteration": 2, "use_board_symmetry_augmentation": False,
+                          "target_sample_reuse": None},
             "runtime": {"pause_while_game_is_active": False},
         })
 
@@ -121,20 +122,20 @@ class RuntimeTests(unittest.TestCase):
             Trainer(self.config(), run_b).save(archive=False)
             source = run_a / "latest.pt"
             target = run_b / "latest.pt"
-            before = file_hash(target)
+            before = sha256_file(target)
             payload, config = load_checkpoint(source)
             with self.assertRaisesRegex(ValueError, "Occupied output"):
                 train(config, run_b, 1, payload, resume_path=source,
-                      resume_checksum=file_hash(source))
-            self.assertEqual(file_hash(target), before)
+                      resume_checksum=sha256_file(source))
+            self.assertEqual(sha256_file(target), before)
             with self.assertRaisesRegex(ValueError, "Occupied output"):
                 train(config, run_a, 1, payload, resume_path=source,
                       resume_checksum="wrong digest")
             with patch("weiqi.rl.runner.Trainer.run_iteration", return_value={}):
                 resumed = train(config, run_a, 1, payload, resume_path=source,
-                                resume_checksum=file_hash(source))
+                                resume_checksum=sha256_file(source))
             self.assertEqual(resumed.iteration, payload["iteration"])
-            self.assertEqual(file_hash(source), file_hash(run_a / "latest.pt"))
+            self.assertEqual(sha256_file(source), sha256_file(run_a / "latest.pt"))
 
     def test_resume_only_restores_scheduled_milestone_anchors(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):

@@ -206,16 +206,16 @@ Windows 启动脚本优先使用项目 `.venv`；未安装本地环境时兼容�
 | 项目 | 默认值 |
 |---|---:|
 | 棋盘 | 9×9 |
-| 网络 | 64 通道、4 个残差块 |
-| 每手 MCTS | 64 次模拟 |
+| 网络 | 64 通道、4 个残差块，含 ownership 与目差辅助头 |
+| 每手 MCTS | 25% 着法完整搜索 64 次并记为样本，其余快速搜索 16 次；每次网络调用合并 4 个叶节点 |
 | 自我对弈进程 | 2 |
-| 每轮自我对弈 | 16 局 |
+| 每轮自我对弈 | 32 局 |
 | 冠军对局占比 | 默认 50%，换色成对安排；其余由候选自我对弈 |
 | 固定局面诊断 | 96 个局面，候选每手搜索 8 次 |
 | 快速初筛 | 每轮 4 局、每手搜索 8 次 |
 | 历史对手池 | 每 3 轮测一次，每个对手 4 局 |
-| 完整晋级评测 | 每 3 轮至多一次，初筛通过才运行 |
-| 训练批次 | 128 |
+| 完整晋级评测 | 每 3 轮至多一次，初筛通过才运行；SPRT 序贯检验，最多 80 局 |
+| 训练批次 | 128；每轮步数按新样本平均复用约 8 次计算 |
 | 最大显存比例 | 60% |
 
 默认关闭自我对弈认输，防止早期弱模型因为错误胜率污染训练结果；默认还要求
@@ -225,8 +225,8 @@ Windows 启动脚本优先使用项目 `.venv`；未安装本地环境时兼容�
 
 只有真实终局的样本进入回放池。达到步数上限的棋局标记为截断并单独统计，
 不编造胜负标签。评测使用成对的相同开局、交换黑白；只有完整晋级赛达到配置的
-得分率门槛、没有截断局，并且配对结果的保守区间下界超过 50%，才更新
-`best.pt`。候选模型始终保存在 `candidate.pt`，即使尚未晋级，也会继续自我对弈。
+得分率门槛、没有截断局，并且换色开局对的序贯检验（SPRT）判定候选更强，才更新
+`best.pt`。各项训练质量设置见 [RL 训练说明](docs/RL_TRAINING.md#训练质量相关设置)。候选模型始终保存在 `candidate.pt`，即使尚未晋级，也会继续自我对弈。
 
 仓库同时提供 `config/rl_training.high_performance.example.json`。该示例选择
 `high_performance` 预设，面向显存较大的高性能 NVIDIA 显卡，启用 19×19、
@@ -297,18 +297,28 @@ weiqi_gui/
 │   ├── engine.py        # 围棋规则与计分
 │   ├── ai.py            # 本地启发式电脑对手
 │   ├── analysis_workbench.py # AI 分析、历史与多分支推演的独立状态模块
+│   ├── analysis_model.py、analysis_parsing.py # 分析工作台的数据类型与 KataGo 结果解析
 │   ├── analysis_gui.py   # 候选/PV、ownership、曲线和变化树窗口
+│   ├── analysis_layout.py、analysis_board.py、analysis_panels.py、analysis_style.py # 分析窗口的布局、棋盘、侧栏与配色
 │   ├── katago.py        # KataGo JSON 协议、职业段位和进程管理
+│   ├── katago_settings.py、katago_protocol.py、katago_moves.py # KataGo 设置与段位档位、协议转换、按档位选着
 │   ├── katago_gui.py    # KataGo 文件配置窗口
 │   ├── winrate.py       # 实时胜率与领先目数估算
 │   ├── rl_config.py     # 强化学习默认/高性能预设、覆盖和校验
 │   ├── rl/              # 特征、策略/价值网络、MCTS、双进程采样与训练闭环
+│   ├── katago_rl.py、katago_rl_cli.py # KataGo 官方自我对弈训练循环与 train_rl.py 命令行
+│   ├── rl_curriculum*.py # 9→13→19 课程：配置、状态、评测、迁移、清理与运行层
+│   ├── rl_metrics*.py、rl_metric_store.py # KataGo 训练指标、历史记录与仪表盘
+│   ├── rl_match.py、rl_retention.py、rl_benchmark.py、rl_migration.py # 课程用的对局统计、清理、批次调优与迁移
+│   ├── fileio.py、sgf.py # 原子写入/文件哈希与 SGF 解析公共工具
 │   ├── rl_activity.py   # 正常对局通知训练器暂停的跨 Windows/WSL 心跳
 │   ├── reasoning.py     # 推理模式的正式棋局快照与临时变化隔离
 │   ├── rules.py         # 程序内中文围棋规则内容
 │   ├── training.py      # 定式/死活课程数据与局部次序回放
 │   ├── training_gui.py  # 交互式推理训练窗口
-│   └── gui.py           # Tkinter 界面
+│   ├── training_layout.py、training_board.py # 推理训练窗口的布局与棋盘
+│   ├── gui_layout.py、gui_board.py、gui_windows.py、gui_status.py、gui_constants.py # 主窗口的布局、棋盘、附属窗口与状态栏
+│   └── gui.py           # Tkinter 主窗口与对局控制
 ├── config/
 │   ├── katago_analysis.cfg # 低内存、单局面 KataGo 分析配置
 │   ├── rl_training.json # 普通电脑默认强化学习配置
@@ -332,6 +342,7 @@ weiqi_gui/
     ├── test_rl_runtime.py # 完整续训、进程退出与运行控制
     ├── test_rl_activity.py # 正常对局暂停训练的心跳与生命周期
     ├── test_rl_evaluation.py # 配对置信区间、固定局面和历史模型不可变性
+    ├── test_rl_quality.py # playout cap、辅助目标、样本复用率与 SPRT
     ├── test_reasoning.py # 推理分支、撤回边界与正式棋局恢复测试
     ├── test_rules.py    # 程序内规则内容测试
     └── test_training.py # 定式/死活课程与回放测试
